@@ -39,7 +39,7 @@ To run this in your own branch (Colab T4 GPU recommended):
    ```bash
    pip install torch tokenizers schrutepy pandas
    ```
-2. Open `officelm.ipynb` and run all cells to train your own manager.
+2. Open `training.ipynb` and run all cells to train your own manager.
 3. Or, if you have the `michael_scott_sft.pt` checkpoint and `michael_scott_tokenizer.json` file, run the interactive terminal chat:
    ```bash
    python chat.py --speaker Jim
