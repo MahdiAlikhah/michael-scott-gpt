@@ -34,17 +34,14 @@ class CausalSelfAttention(nn.Module):
 
         is_causal = (T > 1) and (kv_cache is None)
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=None,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=is_causal,
         )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.c_proj(y)
-        return out, new_cache
+        return self.c_proj(y), new_cache
 
 
 class FeedForward(nn.Module):
@@ -76,7 +73,7 @@ class Block(nn.Module):
         return x, new_cache
 
 
-class MichaelScottGPT(nn.Module):
+class MichaelScottTWSS_Chat(nn.Module):
     def __init__(
         self,
         vocab_size: int = 2048,
@@ -93,33 +90,31 @@ class MichaelScottGPT(nn.Module):
         self.position_embedding = nn.Embedding(block_size, n_embed)
         self.drop = nn.Dropout(dropout)
 
-        self.blocks = nn.ModuleList(
-            [Block(n_embed, n_head, dropout=dropout) for _ in range(n_layer)]
-        )
+        self.blocks = nn.ModuleList([Block(n_embed, n_head, dropout=dropout) for _ in range(n_layer)])
 
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
-
-        # Weight tying between token embeddings and output projection
         self.token_embedding.weight = self.lm_head.weight
 
-        self.apply(self._init_weights)
+        # Stage 3: TWSS Detection Heads
+        self.twss_head = nn.Sequential(
+            nn.LayerNorm(n_embed),
+            nn.Linear(n_embed, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+        self.proj_head = nn.Sequential(
+            nn.Linear(n_embed, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+        )
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx: torch.Tensor, targets=None, kv_cache=None):
+    def forward(self, idx: torch.Tensor, kv_cache=None, eval_twss=False):
         B, T = idx.shape
 
         past_len = kv_cache[0][0].size(2) if kv_cache is not None else 0
-        assert (
-            past_len + T <= self.block_size
-        ), f"Sequence length {past_len + T} exceeds block_size {self.block_size}"
+        assert past_len + T <= self.block_size, f"Sequence length exceeds block_size"
 
         pos = torch.arange(past_len, past_len + T, device=idx.device)
         x = self.drop(self.token_embedding(idx) + self.position_embedding(pos))
@@ -133,78 +128,66 @@ class MichaelScottGPT(nn.Module):
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
-        loss = None
-        if targets is not None:
-            B, T, V = logits.shape
-            loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T))
+        twss_prob = None
+        if eval_twss:
+            # Evaluate TWSS probability on the final token of the user's prompt
+            h_last = x[:, -1, :]
+            twss_logit = self.twss_head(h_last).squeeze(-1)
+            twss_prob = torch.sigmoid(twss_logit).item()
 
-        return logits, loss, new_caches
+        return logits, new_caches, twss_prob
 
 
-def load_artifacts(
-    checkpoint_path: str = "michael_scott_sft.pt",
-    tokenizer_path: str = "michael_scott_tokenizer.json",
-    device: str | None = None,
-):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
+def load_artifacts(checkpoint_path: str, tokenizer_path: str, device: str):
     if not os.path.exists(tokenizer_path):
-        raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     tokenizer = Tokenizer.from_file(tokenizer_path)
     vocab_size = tokenizer.get_vocab_size()
     eot_token = tokenizer.token_to_id("<|endoftext|>")
 
     raw_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state_dict = raw_ckpt["model_state_dict"] if "model_state_dict" in raw_ckpt else raw_ckpt
 
-    # Support both raw state_dict (from SFT) and wrapped dict (from pretraining)
-    if isinstance(raw_ckpt, dict) and "model_state_dict" in raw_ckpt:
-        state_dict = raw_ckpt["model_state_dict"]
-        cfg = raw_ckpt.get("config", {})
-    else:
-        state_dict = raw_ckpt
-        cfg = {}
-
-    model = MichaelScottGPT(
-        vocab_size=cfg.get("vocab_size", vocab_size),
-        n_embed=cfg.get("n_embed", 256),
-        n_head=cfg.get("n_head", 8),
-        n_layer=cfg.get("n_layer", 6),
-        block_size=cfg.get("block_size", 256),
-        dropout=0.0,
-    ).to(device)
-    model.load_state_dict(state_dict)
+    model = MichaelScottTWSS_Chat(vocab_size=vocab_size).to(device)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
 
-    return model, tokenizer, eot_token, device
+    return model, tokenizer, eot_token
 
 
 @torch.no_grad()
 def generate_reply(
-    model: MichaelScottGPT,
+    model: MichaelScottTWSS_Chat,
     tokenizer: Tokenizer,
     eot_token: int,
     conversation_history: str,
     device: str,
     temperature: float = 0.72,
     top_k: int = 40,
-    top_p: float = 0.9,
     rep_penalty: float = 1.15,
-    min_new_tokens: int = 2,
     max_new_tokens: int = 70,
-) -> str:
+    twss_threshold: float = 0.65,
+):
     prompt_ids = tokenizer.encode(conversation_history).ids
-    idx = torch.tensor(
-        [prompt_ids[-(model.block_size - max_new_tokens) :]],
-        dtype=torch.long,
-        device=device,
-    )
+    idx = torch.tensor([prompt_ids[-(model.block_size - max_new_tokens) :]], dtype=torch.long, device=device)
 
-    # Phase 1: Prefill KV cache with conversation history
-    logits, _, kv_cache = model(idx, kv_cache=None)
+    # Phase 1: Prefill KV cache and evaluate TWSS
+    logits, kv_cache, twss_prob = model(idx, kv_cache=None, eval_twss=True)
+    
+    reply_str = ""
+    # If the setup clears the detector threshold, Michael interrupts with the joke!
+    if twss_prob > twss_threshold:
+        joke = "That's what she said! "
+        reply_str += joke
+        # We must append the joke to the KV cache so the model knows it just said it
+        joke_ids = tokenizer.encode(joke).ids
+        for j_id in joke_ids:
+            j_tensor = torch.tensor([[j_id]], dtype=torch.long, device=device)
+            logits, kv_cache, _ = model(j_tensor, kv_cache=kv_cache, eval_twss=False)
+
     reply_ids = []
 
     # Phase 2: Incremental single-token decoding using KV cache
@@ -216,23 +199,9 @@ def generate_reply(
 
         next_logits = next_logits / max(temperature, 1e-5)
 
-        if len(reply_ids) < min_new_tokens and eot_token is not None:
-            next_logits[0, eot_token] = -float("Inf")
-
         if top_k is not None and top_k > 0:
             v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
             next_logits[next_logits < v[:, [-1]]] = -float("Inf")
-
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                1, sorted_indices, sorted_indices_to_remove
-            )
-            next_logits[indices_to_remove] = -float("Inf")
 
         probs = F.softmax(next_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
@@ -252,45 +221,29 @@ def generate_reply(
         if kv_cache[0][0].size(2) >= model.block_size:
             break
 
-        logits, _, kv_cache = model(next_token, kv_cache=kv_cache)
+        logits, kv_cache, _ = model(next_token, kv_cache=kv_cache, eval_twss=False)
 
-    return tokenizer.decode(reply_ids).strip()
+    return reply_str + tokenizer.decode(reply_ids).strip()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chat with MichaelScottGPT")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="michael_scott_sft.pt",
-        help="Path to the trained PyTorch weights (.pt)",
-    )
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="michael_scott_tokenizer.json",
-        help="Path to the trained BPE tokenizer (.json)",
-    )
-    parser.add_argument(
-        "--speaker",
-        type=str,
-        default="Jim",
-        help="Character name you roleplay as in the prompt (default: Jim)",
-    )
+    parser = argparse.ArgumentParser(description="Chat with MichaelScottGPT (TWSS Edition)")
+    parser.add_argument("--checkpoint", type=str, default="weights/michael_scott_twss.pt")
+    parser.add_argument("--tokenizer", type=str, default="weights/michael_scott_tokenizer.json")
+    parser.add_argument("--speaker", type=str, default="Jim")
     parser.add_argument("--temperature", type=float, default=0.72)
     parser.add_argument("--top-k", type=int, default=40)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--rep-penalty", type=float, default=1.15)
-    parser.add_argument("--max-tokens", type=int, default=70)
     args = parser.parse_args()
 
-    model, tokenizer, eot_token, device = load_artifacts(
-        checkpoint_path=args.checkpoint,
-        tokenizer_path=args.tokenizer,
-    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    try:
+        model, tokenizer, eot_token = load_artifacts(args.checkpoint, args.tokenizer, device)
+    except FileNotFoundError as e:
+        print(f"Error: {e}\nPlease ensure your .pt and .json files are inside a 'weights' folder.")
+        return
 
-    param_count = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Loaded MichaelScottGPT ({param_count:.2f}M params) on {device}.")
+    print(f"Loaded MichaelScottGPT (TWSS-Enabled) on {device}.")
     print("Type 'reset' to clear conversation history, or 'quit' to exit.")
     print("-" * 60)
 
@@ -313,6 +266,7 @@ def main():
             continue
 
         history += f"{args.speaker}: {user_input}\nMichael:"
+        
         reply = generate_reply(
             model=model,
             tokenizer=tokenizer,
@@ -321,10 +275,8 @@ def main():
             device=device,
             temperature=args.temperature,
             top_k=args.top_k,
-            top_p=args.top_p,
-            rep_penalty=args.rep_penalty,
-            max_new_tokens=args.max_tokens,
         )
+        
         history += f" {reply}\n"
         print(f"Michael: {reply}\n")
 

@@ -37,12 +37,27 @@ To run this in your own branch (Colab T4 GPU recommended):
 
 1. Install the corporate requirements:
    ```bash
-   pip install torch tokenizers schrutepy pandas
+   pip install -r requirements.txt
    ```
-2. Open `training.ipynb` and run all cells to train your own manager.
-3. Or, if you have the `michael_scott_sft.pt` checkpoint and `michael_scott_tokenizer.json` file, run the interactive terminal chat:
+2. Run the training notebooks, in order, to train your own manager:
+   - `training/1_officelm_pretrain_sft.ipynb` — pretraining + SFT
+   - `training/2_twss_detector.ipynb` — the TWSS detector heads (uses `data/diverse_minimal_pairs.json`)
+3. Or, if you have the `weights/michael_scott_twss.pt` checkpoint and `weights/michael_scott_tokenizer.json` file, run the interactive terminal chat:
    ```bash
    python chat.py --speaker Jim
    ```
+
+### Repository layout
+```text
+chat.py                              Interactive terminal chat (model + KV cache + TWSS gate)
+requirements.txt                     Dependencies
+data/diverse_minimal_pairs.json      Minimal pairs used to train the TWSS detector
+training/1_officelm_pretrain_sft.ipynb   Stage 1: BPE tokenizer, pretraining, SFT
+training/2_twss_detector.ipynb           Stage 3: TWSS / projection heads
+weights/michael_scott_bpe.pt             Pretrained backbone
+weights/michael_scott_sft.pt             SFT backbone
+weights/michael_scott_twss.pt            SFT backbone + trained TWSS heads (used by chat.py)
+weights/michael_scott_tokenizer.json     Custom 2,048-token BPE tokenizer
+```
 
 Catch you on the flippity flip.
